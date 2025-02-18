@@ -26,7 +26,7 @@ async def lifespan(app: FastAPI):
     create_image_id_mapping_table()
     create_images_table()
     create_albums_table()
-    cleanup_face_embeddings()
+    cleanup_face_embeddings()  # This will remove orphaned entries
     init_face_cluster()
     yield
     face_cluster = get_face_cluster()

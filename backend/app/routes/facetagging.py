@@ -5,6 +5,7 @@ from app.database.images import get_path_from_id
 from app.facecluster.init_face_cluster import get_face_cluster
 from app.facenet.preprocess import cosine_similarity
 from app.utils.path_id_mapping import get_id_from_path
+import os
 
 router = APIRouter()
 
@@ -12,27 +13,34 @@ router = APIRouter()
 def face_matching():
     try:
         all_embeddings = get_all_face_embeddings()
-
         similar_pairs = []
 
         for i, img1_data in enumerate(all_embeddings):
+            # Verify image1 exists
+            img1_path = img1_data["image_path"]
+            if not os.path.exists(img1_path):
+                continue
+
             for j, img2_data in enumerate(all_embeddings):
                 if i >= j:
+                    continue
+                    
+                # Verify image2 exists
+                img2_path = img2_data["image_path"]
+                if not os.path.exists(img2_path):
                     continue
 
                 for embedding1 in img1_data["embeddings"]:
                     for embedding2 in img2_data["embeddings"]:
                         similarity = cosine_similarity(embedding1, embedding2)
                         if similarity >= 0.5:
-                            img1 = img1_data["image_path"].split("/")[-1]
-                            img2 = img2_data["image_path"].split("/")[-1]
-                            similar_pairs.append(
-                                {
-                                    "image1": img1,
-                                    "image2": img2,
-                                    "similarity": float(similarity),
-                                }
-                            )
+                            img1 = img1_path.split("/")[-1]
+                            img2 = img2_path.split("/")[-1]
+                            similar_pairs.append({
+                                "image1": img1,
+                                "image2": img2,
+                                "similarity": float(similarity),
+                            })
                             break
                     else:
                         continue
