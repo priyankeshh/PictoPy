@@ -1,6 +1,7 @@
 use crate::models::{FileInfo, FileType};
 use crate::utils::file_utils::{is_image_extension, is_video_extension};
 use walkdir::WalkDir;
+use std::path::PathBuf;
 
 pub struct FileRepository;
 
@@ -35,5 +36,32 @@ impl FileRepository {
                     })
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use std::fs::File;
+    use std::io::Write;
+
+    #[test]
+    fn test_get_files_in_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        
+        // Create test image file
+        let image_path = temp_dir.path().join("test.jpg");
+        File::create(&image_path).unwrap();
+        
+        // Create test video file
+        let video_path = temp_dir.path().join("test.mp4");
+        File::create(&video_path).unwrap();
+        
+        let files = FileRepository::get_files_in_directory(temp_dir.path().to_str().unwrap());
+        
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|f| matches!(f.file_type, FileType::Image)));
+        assert!(files.iter().any(|f| matches!(f.file_type, FileType::Video)));
     }
 }

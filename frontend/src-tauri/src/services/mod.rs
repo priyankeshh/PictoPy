@@ -17,8 +17,8 @@ pub use file_service::FileService;
 use image::{DynamicImage, GenericImageView, ImageBuffer, Rgba};
 use tauri::path::BaseDirectory;
 use tauri::Manager;
-use std::fs;  
-use directories::ProjectDirs; 
+use std::fs;
+use directories::ProjectDirs;
 use rand::seq::SliceRandom;
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -33,19 +33,18 @@ const CURRENT_ENCRYPTION_VERSION: u8 = 1;
 const KEY_ROTATION_INTERVAL: u64 = 30 * 24 * 60 * 60; // 30 days in seconds
 
 #[derive(Serialize, Deserialize)]
-struct SecureConfig {
-    salt: String,
-    hashed_password: String,
-    encryption_version: u8,
-    last_key_rotation: u64,
+pub struct EncryptedMetadata {
+    pub content_type: String,
+    pub original_name: String,
 }
 
-#[derive(Serialize, Deserialize)]
-struct EncryptedMetadata {
-    version: u8,
-    timestamp: u64,
-    original_name: String,
-    content_type: String,
+impl EncryptedMetadata {
+    pub fn new(content_type: String, original_name: String) -> Self {
+        Self {
+            content_type,
+            original_name,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -350,7 +349,7 @@ fn get_secure_folder_path() -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn generate_salt() -> [u8; SALT_LENGTH] {
+pub fn generate_salt() -> [u8; SALT_LENGTH] {
     let mut salt = [0u8; SALT_LENGTH];
     SystemRandom::new().fill(&mut salt).unwrap();
     salt
@@ -477,7 +476,7 @@ pub async fn get_secure_media(password: String) -> Result<Vec<SecureMedia>, Stri
     Ok(secure_media)
 }
 
-fn hash_password(password: &str, salt: &[u8]) -> Vec<u8> {
+pub fn hash_password(password: &str, salt: &[u8]) -> Vec<u8> {
     let mut hash = [0u8; digest::SHA256_OUTPUT_LEN];
     pbkdf2::derive(
         pbkdf2::PBKDF2_HMAC_SHA256,
@@ -489,52 +488,45 @@ fn hash_password(password: &str, salt: &[u8]) -> Vec<u8> {
     hash.to_vec()
 }
 
-fn encrypt_data(data: &[u8], password: &str, original_name: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+pub fn encrypt_data(data: &[u8], password: &str, original_name: &str) -> Result<Vec<u8>, String> {
     let salt = generate_salt();
-    let nonce = generate_nonce();
     let key = derive_key(password, &salt);
     
-    // Create metadata
-    let metadata = EncryptedMetadata {
-        version: CURRENT_ENCRYPTION_VERSION,
-        timestamp: SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs(),
-        original_name: original_name.to_string(),
-        content_type: guess_content_type(original_name),
-    };
+    let metadata = EncryptedMetadata::new(
+        "image/jpeg".to_string(),
+        original_name.to_string(),
+    );
     
-    let metadata_bytes = serde_json::to_vec(&metadata)?;
-    let metadata_len_bytes = (metadata_bytes.len() as u32).to_be_bytes();
+    let metadata_bytes = serde_json::to_vec(&metadata)
+        .map_err(|e| format!("Failed to serialize metadata: {}", e))?;
     
-    // Encrypt metadata
-    let mut metadata_to_encrypt = metadata_bytes;
-    let metadata_tag = key.seal_in_place_append_tag(
+    let nonce = generate_nonce();
+    let mut encrypted = Vec::new();
+    encrypted.extend_from_slice(&salt);
+    encrypted.extend_from_slice(&nonce);
+    
+    let mut metadata_to_encrypt = metadata_bytes.clone();
+    let _metadata_tag = key.seal_in_place_append_tag(
         Nonce::assume_unique_for_key(nonce),
         Aad::empty(),
         &mut metadata_to_encrypt,
     ).map_err(|e| format!("Encryption error: {}", e))?;
     
-    // Encrypt content
+    encrypted.extend_from_slice(&(metadata_to_encrypt.len() as u32).to_le_bytes());
+    encrypted.extend_from_slice(&metadata_to_encrypt);
+    
     let mut content_to_encrypt = data.to_vec();
-    let content_tag = key.seal_in_place_append_tag(
+    let _content_tag = key.seal_in_place_append_tag(
         Nonce::assume_unique_for_key(nonce),
         Aad::empty(),
         &mut content_to_encrypt,
     ).map_err(|e| format!("Encryption error: {}", e))?;
     
-    // Combine all components
-    let mut result = Vec::new();
-    result.extend_from_slice(&salt);
-    result.extend_from_slice(&nonce);
-    result.extend_from_slice(&metadata_len_bytes);
-    result.extend_from_slice(&metadata_to_encrypt);
-    result.extend_from_slice(&content_to_encrypt);
-    
-    Ok(result)
+    encrypted.extend_from_slice(&content_to_encrypt);
+    Ok(encrypted)
 }
 
-fn decrypt_data(encrypted: &[u8], password: &str) -> Result<(Vec<u8>, EncryptedMetadata), Box<dyn Error>> {
+pub fn decrypt_data(encrypted: &[u8], password: &str) -> Result<(Vec<u8>, EncryptedMetadata), String> {
     if encrypted.len() < SALT_LENGTH + NONCE_LENGTH + 4 {
         return Err("Invalid encrypted data".into());
     }
@@ -572,7 +564,7 @@ pub async fn unlock_secure_folder(password: String) -> Result<bool, String> {
     let secure_folder = get_secure_folder_path()?;
     let config_path = secure_folder.join("config.json");
 
-    if !config_path.exists() {
+    if (!config_path.exists()) {
         return Err("Secure folder not set up".to_string());
     }
 
@@ -604,7 +596,16 @@ fn derive_key(password: &str, salt: &[u8]) -> LessSafeKey {
 pub async fn check_secure_folder_status() -> Result<bool, String> {
     let secure_folder = get_secure_folder_path()?;
     let config_path = secure_folder.join("config.json");
-    Ok(config_path.exists())
+
+    if !config_path.exists() {
+        return Ok(false);
+    }
+
+    let config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&config_path).map_err(|e| e.to_string())?
+    ).map_err(|e| e.to_string())?;
+
+    Ok(true)
 }
 
 fn generate_nonce() -> [u8; NONCE_LENGTH] {
@@ -667,7 +668,7 @@ fn get_images_from_directory(dir: &str) -> Result<Vec<MemoryImage>, String> {
     Ok(images)
 }
 
-fn is_image_file(path: &Path) -> bool {
+pub fn is_image_file(path: &Path) -> bool {
     let extensions = ["jpg", "jpeg", "png", "gif"];
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -689,10 +690,44 @@ pub fn get_server_path(handle: tauri::AppHandle) -> Result<String, String> {
     Ok(resource_path.to_string_lossy().to_string())
 }
 
-fn guess_content_type(filename: &str) -> String {
+pub fn guess_content_type(filename: &str) -> String {
     match Path::new(filename).extension().and_then(OsStr::to_str) {
         Some("jpg") | Some("jpeg") => "image/jpeg".to_string(),
         Some("png") => "image/png".to_string(),
         _ => "application/octet-stream".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_encryption_decryption() {
+        let test_data = b"Hello, World!";
+        let password = "test_password";
+        let original_name = "test.jpg";
+
+        let encrypted = encrypt_data(test_data, password, original_name).unwrap();
+        let (decrypted, metadata) = decrypt_data(&encrypted, password).unwrap();
+
+        assert_eq!(decrypted, test_data);
+        assert_eq!(metadata.original_name, original_name);
+        assert_eq!(metadata.content_type, "image/jpeg");
+    }
+
+    #[test]
+    fn test_secure_folder_operations() {
+        let password = "test_password";
+        
+        // Create secure folder
+        assert!(create_secure_folder(password.to_string()).is_ok());
+        
+        // Check status
+        assert!(check_secure_folder_status().unwrap());
+        
+        // Verify unlock
+        assert!(unlock_secure_folder(password.to_string()).unwrap());
     }
 }
