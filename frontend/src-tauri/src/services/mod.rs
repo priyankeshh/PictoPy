@@ -22,6 +22,9 @@ use directories::ProjectDirs;
 use rand::seq::SliceRandom;
 use std::collections::HashSet;
 use uuid::Uuid;
+use std::error::Error;
+use std::ffi::OsStr;
+use arrayref::array_ref;
 
 const SECURE_FOLDER_NAME: &str = "secure_folder";
 const SALT_LENGTH: usize = 16;
@@ -403,7 +406,7 @@ pub async fn remove_from_secure_folder(file_name: String, password: String) -> R
     let original_path = metadata.get(&file_name).ok_or("Original path not found")?;
 
     // Write the decrypted content back to the original path
-    fs::write(original_path, decrypted_content).map_err(|e| e.to_string())?;
+    fs::write(original_path, decrypted_content.0).map_err(|e| e.to_string())?;
 
     // Remove the file from the secure folder and update metadata
     fs::remove_file(&file_path).map_err(|e| e.to_string())?;
@@ -457,7 +460,7 @@ pub async fn get_secure_media(password: String) -> Result<Vec<SecureMedia>, Stri
 
             let temp_dir = std::env::temp_dir();
             let temp_file = temp_dir.join(path.file_name().unwrap());
-            fs::write(&temp_file, decrypted).map_err(|e| e.to_string())?;
+            fs::write(&temp_file, decrypted.0).map_err(|e| e.to_string())?;
             println!("SecureMedia: {:?}", path.to_string_lossy().to_string());
             println!("SecureMedia: {:?}", temp_file.to_string_lossy().to_string());
             
@@ -489,7 +492,7 @@ fn hash_password(password: &str, salt: &[u8]) -> Vec<u8> {
 fn encrypt_data(data: &[u8], password: &str, original_name: &str) -> Result<Vec<u8>, Box<dyn Error>> {
     let salt = generate_salt();
     let nonce = generate_nonce();
-    let key = derive_key(password, &salt)?;
+    let key = derive_key(password, &salt);
     
     // Create metadata
     let metadata = EncryptedMetadata {
@@ -504,26 +507,29 @@ fn encrypt_data(data: &[u8], password: &str, original_name: &str) -> Result<Vec<
     let metadata_bytes = serde_json::to_vec(&metadata)?;
     let metadata_len_bytes = (metadata_bytes.len() as u32).to_be_bytes();
     
-    // Encrypt both metadata and content
-    let mut encrypted_metadata = key.seal_in_place_append_tag(
+    // Encrypt metadata
+    let mut metadata_to_encrypt = metadata_bytes;
+    let metadata_tag = key.seal_in_place_append_tag(
         Nonce::assume_unique_for_key(nonce),
         Aad::empty(),
-        &mut metadata_bytes.to_vec(),
-    )?;
+        &mut metadata_to_encrypt,
+    ).map_err(|e| format!("Encryption error: {}", e))?;
     
-    let mut encrypted_content = key.seal_in_place_append_tag(
+    // Encrypt content
+    let mut content_to_encrypt = data.to_vec();
+    let content_tag = key.seal_in_place_append_tag(
         Nonce::assume_unique_for_key(nonce),
         Aad::empty(),
-        &mut data.to_vec(),
-    )?;
+        &mut content_to_encrypt,
+    ).map_err(|e| format!("Encryption error: {}", e))?;
     
     // Combine all components
     let mut result = Vec::new();
     result.extend_from_slice(&salt);
     result.extend_from_slice(&nonce);
     result.extend_from_slice(&metadata_len_bytes);
-    result.extend_from_slice(&encrypted_metadata);
-    result.extend_from_slice(&encrypted_content);
+    result.extend_from_slice(&metadata_to_encrypt);
+    result.extend_from_slice(&content_to_encrypt);
     
     Ok(result)
 }
@@ -538,8 +544,7 @@ fn decrypt_data(encrypted: &[u8], password: &str) -> Result<(Vec<u8>, EncryptedM
     let metadata_len_bytes = array_ref!(encrypted, SALT_LENGTH + NONCE_LENGTH, 4);
     let metadata_len = u32::from_be_bytes(*metadata_len_bytes) as usize;
     
-    let key = derive_key(password, salt)?;
-    
+    let key = derive_key(password, salt);
     let metadata_start = SALT_LENGTH + NONCE_LENGTH + 4;
     let metadata_end = metadata_start + metadata_len;
     let mut encrypted_metadata = encrypted[metadata_start..metadata_end].to_vec();
@@ -548,7 +553,7 @@ fn decrypt_data(encrypted: &[u8], password: &str) -> Result<(Vec<u8>, EncryptedM
         Nonce::assume_unique_for_key(*nonce),
         Aad::empty(),
         &mut encrypted_metadata,
-    )?;
+    ).map_err(|e| format!("Decryption error: {}", e))?;
     
     let metadata: EncryptedMetadata = serde_json::from_slice(metadata_bytes)?;
     
@@ -557,7 +562,7 @@ fn decrypt_data(encrypted: &[u8], password: &str) -> Result<(Vec<u8>, EncryptedM
         Nonce::assume_unique_for_key(*nonce),
         Aad::empty(),
         &mut encrypted_content,
-    )?;
+    ).map_err(|e| format!("Decryption error: {}", e))?;
     
     Ok((content.to_vec(), metadata))
 }

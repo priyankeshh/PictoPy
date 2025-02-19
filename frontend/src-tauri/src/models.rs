@@ -10,3 +10,4 @@ pub enum FileType {
     Video,
     Other,
 }
+
