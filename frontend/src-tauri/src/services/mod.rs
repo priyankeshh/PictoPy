@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{PathBuf, Path};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::State;
 mod cache_service;
 mod file_service;
@@ -20,11 +20,30 @@ use tauri::Manager;
 use std::fs;  
 use directories::ProjectDirs; 
 use rand::seq::SliceRandom;
-use std::collections::HashSet; 
+use std::collections::HashSet;
+use uuid::Uuid;
 
 const SECURE_FOLDER_NAME: &str = "secure_folder";
 const SALT_LENGTH: usize = 16;
 const NONCE_LENGTH: usize = 12;
+const CURRENT_ENCRYPTION_VERSION: u8 = 1;
+const KEY_ROTATION_INTERVAL: u64 = 30 * 24 * 60 * 60; // 30 days in seconds
+
+#[derive(Serialize, Deserialize)]
+struct SecureConfig {
+    salt: String,
+    hashed_password: String,
+    encryption_version: u8,
+    last_key_rotation: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct EncryptedMetadata {
+    version: u8,
+    timestamp: u64,
+    original_name: String,
+    content_type: String,
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct SecureMedia {
@@ -337,41 +356,35 @@ fn generate_salt() -> [u8; SALT_LENGTH] {
 #[tauri::command]
 pub async fn move_to_secure_folder(path: String, password: String) -> Result<(), String> {
     let secure_folder = get_secure_folder_path()?;
-    let file_name = Path::new(&path).file_name().ok_or("Invalid file name")?;
-    let dest_path = secure_folder.join(file_name);
-
+    let file_name = Path::new(&path)
+        .file_name()
+        .ok_or("Invalid file name")?
+        .to_string_lossy()
+        .to_string();
+    
+    // Generate a random UUID for the secure filename
+    let secure_name = format!("{}.enc", Uuid::new_v4());
+    let dest_path = secure_folder.join(&secure_name);
+    
     let content = fs::read(&path).map_err(|e| e.to_string())?;
-    let ciphertext_length = content.len() + AES_256_GCM.tag_len();
-    let _expected_length = SALT_LENGTH + NONCE_LENGTH + ciphertext_length + 16;
-    let encrypted = encrypt_data(&content, &password).map_err(|e| e.to_string())?;
-    println!("Encrypted file size: {}", encrypted.len());
+    let encrypted = encrypt_data(&content, &password, &file_name)
+        .map_err(|e| e.to_string())?;
+    
     fs::write(&dest_path, encrypted).map_err(|e| e.to_string())?;
-    println!("Encrypted file saved to: {:?}", secure_folder);
-    fs::remove_file(&path).map_err(|e| e.to_string())?;
-
-    let thumbnails_folder = Path::new(&path)
-    .parent() // Get parent directory of the original file
-    .and_then(|parent| parent.join("PictoPy.thumbnails").canonicalize().ok()) // Navigate to PictoPy.thumbnails
-    .ok_or("Unable to locate thumbnails directory")?;
-    let thumbnail_path = thumbnails_folder.join(file_name);
-
-    if thumbnail_path.exists() {
-        fs::remove_file(&thumbnail_path).map_err(|e| e.to_string())?;
-        println!("Thumbnail deleted: {:?}", thumbnail_path);
-    } else {
-        println!("Thumbnail not found: {:?}", thumbnail_path);
-    }
-
-    // Store the original path
+    
+    // Update metadata file
     let metadata_path = secure_folder.join("metadata.json");
     let mut metadata: HashMap<String, String> = if metadata_path.exists() {
-        serde_json::from_str(&fs::read_to_string(&metadata_path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?
+        let content = fs::read_to_string(&metadata_path).map_err(|e| e.to_string())?;
+        serde_json::from_str(&content).unwrap_or_default()
     } else {
         HashMap::new()
     };
-    metadata.insert(file_name.to_string_lossy().to_string(), path);
-    fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).map_err(|e| e.to_string())?;
-
+    
+    metadata.insert(secure_name, file_name);
+    fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap())
+        .map_err(|e| e.to_string())?;
+    
     Ok(())
 }
 
@@ -405,21 +418,27 @@ pub async fn remove_from_secure_folder(file_name: String, password: String) -> R
 pub async fn create_secure_folder(password: String) -> Result<(), String> {
     let secure_folder = get_secure_folder_path()?;
     fs::create_dir_all(&secure_folder).map_err(|e| e.to_string())?;
-    println!("Secure folder path: {:?}", secure_folder);
-
+    
     let salt = generate_salt();
     let hashed_password = hash_password(&password, &salt);
-
+    
+    let config = SecureConfig {
+        salt: BASE64.encode(&salt),
+        hashed_password: BASE64.encode(&hashed_password),
+        encryption_version: CURRENT_ENCRYPTION_VERSION,
+        last_key_rotation: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_secs(),
+    };
+    
     let config_path = secure_folder.join("config.json");
-    let config = serde_json::json!({
-        "salt": BASE64.encode(&salt),
-        "hashed_password": BASE64.encode(&hashed_password),
-    });
-    fs::write(config_path, serde_json::to_string(&config).unwrap()).map_err(|e| e.to_string())?;
-
+    fs::write(config_path, serde_json::to_string(&config).unwrap())
+        .map_err(|e| e.to_string())?;
+    
     let nomedia_path = secure_folder.join(".nomedia");
     fs::write(nomedia_path, "").map_err(|e| e.to_string())?;
-
+    
     Ok(())
 }
 
@@ -467,57 +486,80 @@ fn hash_password(password: &str, salt: &[u8]) -> Vec<u8> {
     hash.to_vec()
 }
 
-fn encrypt_data(data: &[u8], password: &str) -> Result<Vec<u8>, ring::error::Unspecified> {
+fn encrypt_data(data: &[u8], password: &str, original_name: &str) -> Result<Vec<u8>, Box<dyn Error>> {
     let salt = generate_salt();
-    let key = derive_key(password, &salt);
     let nonce = generate_nonce();
-
-    let mut in_out = data.to_vec();
-    let tag = key.seal_in_place_separate_tag(
+    let key = derive_key(password, &salt)?;
+    
+    // Create metadata
+    let metadata = EncryptedMetadata {
+        version: CURRENT_ENCRYPTION_VERSION,
+        timestamp: SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_secs(),
+        original_name: original_name.to_string(),
+        content_type: guess_content_type(original_name),
+    };
+    
+    let metadata_bytes = serde_json::to_vec(&metadata)?;
+    let metadata_len_bytes = (metadata_bytes.len() as u32).to_be_bytes();
+    
+    // Encrypt both metadata and content
+    let mut encrypted_metadata = key.seal_in_place_append_tag(
         Nonce::assume_unique_for_key(nonce),
         Aad::empty(),
-        &mut in_out
+        &mut metadata_bytes.to_vec(),
     )?;
-
+    
+    let mut encrypted_content = key.seal_in_place_append_tag(
+        Nonce::assume_unique_for_key(nonce),
+        Aad::empty(),
+        &mut data.to_vec(),
+    )?;
+    
+    // Combine all components
     let mut result = Vec::new();
     result.extend_from_slice(&salt);
     result.extend_from_slice(&nonce);
-    result.extend_from_slice(&in_out);
-    result.extend_from_slice(tag.as_ref());
-
+    result.extend_from_slice(&metadata_len_bytes);
+    result.extend_from_slice(&encrypted_metadata);
+    result.extend_from_slice(&encrypted_content);
+    
     Ok(result)
 }
 
-fn decrypt_data(encrypted: &[u8], password: &str) -> Result<Vec<u8>, String> {
-    println!("Decrypting data...");
+fn decrypt_data(encrypted: &[u8], password: &str) -> Result<(Vec<u8>, EncryptedMetadata), Box<dyn Error>> {
+    if encrypted.len() < SALT_LENGTH + NONCE_LENGTH + 4 {
+        return Err("Invalid encrypted data".into());
+    }
     
-    if encrypted.len() < SALT_LENGTH + NONCE_LENGTH + 16 {
-        return Err(format!("Encrypted data too short: {} bytes", encrypted.len()));
-    }
-
-    let salt = &encrypted[..SALT_LENGTH];
-    let nonce = &encrypted[SALT_LENGTH..SALT_LENGTH + NONCE_LENGTH];
-    let tag_len = 16;
-    let (ciphertext, tag) = encrypted[SALT_LENGTH + NONCE_LENGTH..].split_at(encrypted.len() - SALT_LENGTH - NONCE_LENGTH - tag_len);
-
-    let key = derive_key(password, salt);
-    let nonce = match Nonce::try_assume_unique_for_key(nonce) {
-        Ok(n) => n,
-        Err(e) => return Err(format!("Nonce error: {:?}", e)),
-    };
-
-    let mut plaintext = ciphertext.to_vec();
-    plaintext.extend_from_slice(tag);
-
-    match key.open_in_place(nonce, Aad::empty(), &mut plaintext) {
-        Ok(decrypted) => {
-            println!("Decryption successful! Decrypted length: {}", decrypted.len());
-            Ok(decrypted.to_vec())
-        },
-        Err(e) => {
-            Err(format!("Decryption error: {:?}", e))
-        }
-    }
+    let salt = array_ref!(encrypted, 0, SALT_LENGTH);
+    let nonce = array_ref!(encrypted, SALT_LENGTH, NONCE_LENGTH);
+    let metadata_len_bytes = array_ref!(encrypted, SALT_LENGTH + NONCE_LENGTH, 4);
+    let metadata_len = u32::from_be_bytes(*metadata_len_bytes) as usize;
+    
+    let key = derive_key(password, salt)?;
+    
+    let metadata_start = SALT_LENGTH + NONCE_LENGTH + 4;
+    let metadata_end = metadata_start + metadata_len;
+    let mut encrypted_metadata = encrypted[metadata_start..metadata_end].to_vec();
+    
+    let metadata_bytes = key.open_in_place(
+        Nonce::assume_unique_for_key(*nonce),
+        Aad::empty(),
+        &mut encrypted_metadata,
+    )?;
+    
+    let metadata: EncryptedMetadata = serde_json::from_slice(metadata_bytes)?;
+    
+    let mut encrypted_content = encrypted[metadata_end..].to_vec();
+    let content = key.open_in_place(
+        Nonce::assume_unique_for_key(*nonce),
+        Aad::empty(),
+        &mut encrypted_content,
+    )?;
+    
+    Ok((content.to_vec(), metadata))
 }
 
 #[tauri::command]
@@ -640,4 +682,12 @@ pub fn get_server_path(handle: tauri::AppHandle) -> Result<String, String> {
         .resolve("resources/server", BaseDirectory::Resource)
         .map_err(|e| e.to_string())?;
     Ok(resource_path.to_string_lossy().to_string())
+}
+
+fn guess_content_type(filename: &str) -> String {
+    match Path::new(filename).extension().and_then(OsStr::to_str) {
+        Some("jpg") | Some("jpeg") => "image/jpeg".to_string(),
+        Some("png") => "image/png".to_string(),
+        _ => "application/octet-stream".to_string(),
+    }
 }

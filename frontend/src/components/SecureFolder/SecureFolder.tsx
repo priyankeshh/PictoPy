@@ -8,6 +8,9 @@ interface SecureMedia {
   id: string;
   url: string;
   path: string;
+  originalName: string;
+  timestamp: number;
+  contentType: string;
 }
 
 const SecureFolder: React.FC = () => {
